@@ -1,0 +1,107 @@
+--Query 1: volume and transactions
+WITH buy_vol AS (
+  SELECT
+    DATE(block_time) AS day,
+    COUNT(*) AS buy_trans_count,
+    SUM(token_bought_amount) AS buy_tokens,
+    SUM(amount_usd) AS buy_usd_vol,
+    SUM(fee_usd) AS buy_fees
+  FROM
+    dex_solana.trades
+  WHERE
+    token_bought_mint_address LIKE '${token_CA}'
+  GROUP BY
+    1
+),
+sell_vol AS (
+  SELECT
+    DATE(block_time) AS day,
+    COUNT(*) AS sell_trans_count,
+    SUM(token_sold_amount) AS sold_tokens,
+    SUM(amount_usd) AS sold_usd_vol,
+    SUM(fee_usd) AS sold_fees
+  FROM
+    dex_solana.trades
+  WHERE
+    token_sold_mint_address LIKE '${token_CA}' 
+  GROUP BY
+    1
+)
+SELECT
+  COALESCE(b.day, s.day) AS day,
+  COALESCE(b.buy_trans_count, 0) + COALESCE(s.sell_trans_count, 0) AS total_trans_count,
+   SUM(COALESCE(b.buy_trans_count, 0) + COALESCE(s.sell_trans_count, 0)) OVER (ORDER BY COALESCE(b.day, s.day)) AS cumulative_trans_count,
+  COALESCE(b.buy_tokens, 0) AS buy_tokens,
+  COALESCE(s.sold_tokens, 0) AS sold_tokens,
+  COALESCE(b.buy_usd_vol, 0) - COALESCE(s.sold_usd_vol, 0) AS net_usd_vol,
+  SUM(COALESCE(b.buy_usd_vol, 0)) OVER (ORDER BY COALESCE(b.day, s.day)) AS cumulative_buy_usd_vol,
+  SUM(COALESCE(s.sold_usd_vol, 0)) OVER (ORDER BY COALESCE(b.day, s.day)) AS cumulative_sold_usd_vol,
+  (SUM(COALESCE(b.buy_usd_vol, 0)) OVER (ORDER BY COALESCE(b.day, s.day)) + SUM(COALESCE(s.sold_usd_vol, 0)) OVER (ORDER BY COALESCE(b.day, s.day)))/1000000 as cumulative_total_usd_volume,
+  COALESCE(b.buy_usd_vol, 0) AS buy_usd_vol,
+  COALESCE(s.sold_usd_vol, 0) AS sold_usd_vol,
+  COALESCE(b.buy_usd_vol, 0) + COALESCE(s.sold_usd_vol, 0) as total_usd_volume
+    
+FROM
+  buy_vol b
+FULL OUTER JOIN
+  sell_vol s ON b.day = s.day
+GROUP BY
+  1, b.buy_usd_vol, s.sold_usd_vol, b.buy_trans_count, s.sell_trans_count, b.buy_tokens, s.sold_tokens, b.buy_fees, s.sold_fees
+ORDER BY
+  day DESC;
+
+
+--Query 2: top holders
+WITH price AS(
+SELECT
+    date_trunc('hour',block_time) as time,
+    COUNT(*) as n_samples,
+    APPROX_PERCENTILE(value,.5) as USD
+FROM (
+    SELECT
+        amount_usd/token_bought_amount as value,
+        block_time
+        FROM dex_solana.trades
+    WHERE block_time >= DATE('2024-11-01')
+        and amount_usd > 1
+        and amount_usd is not null 
+        and token_bought_amount > 0 
+        and token_bought_mint_address = '${token_CA}'
+
+    UNION ALL
+    
+    SELECT
+        amount_usd/token_sold_amount as value,
+        block_time
+    FROM dex_solana.trades
+    WHERE block_time >= DATE('2024-11-01')
+        and amount_usd is not null 
+        and token_sold_amount > 0 
+        and token_sold_mint_address = '${token_CA}'
+) f
+WHERE value < 1000
+GROUP BY 1
+ORDER BY 1 DESC
+LIMIT 1
+)
+,
+top_holders AS(
+SELECT token_balance_owner as address,token_balance, FORMAT(CAST(ROUND(token_balance / ${token_supply} * 100, 2)as varchar), '0.##%') as supply_owned
+FROM solana_utils.latest_balances 
+where token_balance > 1 AND token_mint_address= '${token_CA}'
+ORDER BY token_balance DESC
+LIMIT 10
+)
+SELECT
+address, supply_owned, token_balance * p.USD as USD_value, p.USD as current_price
+FROM top_holders
+JOIN price p on 1=1
+;
+--Query 3: n of holders
+SELECT COUNT(distinct token_balance_owner) as unique_holders
+FROM solana_utils.latest_balances
+WHERE token_balance > 1 AND token_mint_address= '${token_CA}'
+;
+
+
+
