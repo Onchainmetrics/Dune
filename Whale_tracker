@@ -1,0 +1,167 @@
+WITH 
+-- 1. First get current price
+price AS (
+    SELECT
+        date_trunc('hour',block_time) as time,
+        COUNT(*) as n_samples,
+        APPROX_PERCENTILE(value,.5) as USD
+    FROM (
+        SELECT
+            amount_usd/token_bought_amount as value,
+            block_time
+        FROM dex_solana.trades
+        WHERE block_time >= DATE('{{Start Date}}')
+            and amount_usd > 1
+            and amount_usd is not null 
+            and token_bought_amount > 0 
+            and token_bought_mint_address = '{{Contract Address}}'
+
+        UNION ALL
+        
+        SELECT
+            amount_usd/token_sold_amount as value,
+            block_time
+        FROM dex_solana.trades
+        WHERE block_time >= DATE('{{Start Date}}')
+            and amount_usd is not null 
+            and token_sold_amount > 0 
+            and token_sold_mint_address = '{{Contract Address}}'
+    ) f
+    WHERE value < 1000
+    GROUP BY 1
+    ORDER BY 1 DESC
+    LIMIT 1
+),
+
+-- 2. Get current top 100 holders
+top_holders AS (
+    WITH real_traders AS (
+        SELECT DISTINCT
+            trader_id
+        FROM dex_solana.trades
+        WHERE token_bought_mint_address = '{{Contract Address}}'
+        AND block_time >= DATE('{{Start Date}}')
+    )
+    SELECT 
+        token_balance_owner as address,
+        token_balance, 
+        FORMAT(CAST(ROUND(token_balance / {{Total Supply}} * 100, 2)as varchar), '0.##%') as supply_owned
+    FROM solana_utils.latest_balances lb
+    WHERE token_balance > 1 
+    AND token_mint_address = '{{Contract Address}}'
+    AND EXISTS (
+        SELECT 1 
+        FROM real_traders rt 
+        WHERE rt.trader_id = lb.token_balance_owner
+    )
+    ORDER BY token_balance DESC
+    LIMIT 100
+),
+-- 3. Calculate trading activity for these holders over different time periods
+holder_activity AS (
+    SELECT 
+        trader_id,
+        -- 7 day period
+        SUM(CASE 
+            WHEN block_time >= current_date - INTERVAL '7' day 
+            THEN (CASE 
+                WHEN token_bought_mint_address = '{{Contract Address}}' THEN token_bought_amount
+                WHEN token_sold_mint_address = '{{Contract Address}}' THEN -token_sold_amount
+                ELSE 0
+            END)
+            ELSE 0 
+        END) as net_position_7d,
+        
+        -- 14 day period
+        SUM(CASE 
+            WHEN block_time >= current_date - INTERVAL '14' day 
+            THEN (CASE 
+                WHEN token_bought_mint_address = '{{Contract Address}}' THEN token_bought_amount
+                WHEN token_sold_mint_address = '{{Contract Address}}' THEN -token_sold_amount
+                ELSE 0
+            END)
+            ELSE 0 
+        END) as net_position_14d,
+        
+        -- 30 day period
+        SUM(CASE 
+            WHEN block_time >= current_date - INTERVAL '30' day 
+            THEN (CASE 
+                WHEN token_bought_mint_address = '{{Contract Address}}' THEN token_bought_amount
+                WHEN token_sold_mint_address = '{{Contract Address}}' THEN -token_sold_amount
+                ELSE 0
+            END)
+            ELSE 0 
+        END) as net_position_30d
+    FROM dex_solana.trades
+    WHERE block_time >= current_date - INTERVAL '30' day
+    AND trader_id IN (SELECT address FROM top_holders)  -- Only analyze top holders
+    GROUP BY trader_id
+),
+-- New CTE for PnL calculations
+wallet_pnl AS (
+    SELECT 
+        trader_id,
+        -- Track total cost of acquisitions (for cost basis)
+        SUM(CASE 
+            WHEN token_bought_mint_address = '{{Contract Address}}' 
+            THEN amount_usd 
+            ELSE 0 
+        END) as total_acquisition_cost,
+        
+        -- Track total value of sales
+        SUM(CASE 
+            WHEN token_sold_mint_address = '{{Contract Address}}' 
+            THEN amount_usd 
+            ELSE 0 
+        END) as total_sale_proceeds,
+        
+        -- Flag if they've ever sold
+        COUNT(CASE 
+            WHEN token_sold_mint_address = '{{Contract Address}}' 
+            THEN 1 
+        END) as number_of_sells
+    FROM dex_solana.trades
+    WHERE (token_bought_mint_address = '{{Contract Address}}' 
+           OR token_sold_mint_address = '{{Contract Address}}')
+    AND trader_id IN (SELECT address FROM top_holders)
+    GROUP BY trader_id
+)
+
+-- Final SELECT
+SELECT 
+    h.address,
+    h.supply_owned,
+    h.token_balance,
+    h.token_balance * p.USD as usd_value,
+    (h.token_balance * p.USD) - COALESCE(w.total_acquisition_cost, 0) as unrealized_pnl,
+    -- Realized PnL: Only show if they've actually sold
+    CASE 
+        WHEN COALESCE(w.number_of_sells, 0) = 0 THEN 0
+        ELSE COALESCE(w.total_sale_proceeds - w.total_acquisition_cost, 0)
+    END as realized_pnl,
+    COALESCE(ha.net_position_7d, 0) as net_position_7d,
+    COALESCE(ha.net_position_7d, 0) * p.USD as usd_position_7d,
+    COALESCE(ha.net_position_14d, 0) as net_position_14d,
+    COALESCE(ha.net_position_14d, 0) * p.USD as usd_position_14d,
+    COALESCE(ha.net_position_30d, 0) as net_position_30d,
+    COALESCE(ha.net_position_30d, 0) * p.USD as usd_position_30d,
+    CASE 
+        WHEN COALESCE(ha.net_position_7d, 0) > 0 
+            AND COALESCE(ha.net_position_14d, 0) > 0 
+            AND COALESCE(ha.net_position_30d, 0) > 0 
+        THEN 'ACCUMULATING'
+        WHEN COALESCE(ha.net_position_7d, 0) < 0 
+            AND COALESCE(ha.net_position_14d, 0) < 0 
+            AND COALESCE(ha.net_position_30d, 0) < 0 
+        THEN 'DISTRIBUTING'
+        WHEN ABS(COALESCE(ha.net_position_30d, 0)) < (h.token_balance * 0.05) -- Less than 5% movement
+        THEN 'HOLDING'
+        ELSE 'MIXED'
+    END as behavior_pattern,
+    p.USD as current_price
+FROM top_holders h
+CROSS JOIN price p
+LEFT JOIN holder_activity ha ON h.address = ha.trader_id
+LEFT JOIN wallet_pnl w ON h.address = w.trader_id
+ORDER BY usd_value DESC;
